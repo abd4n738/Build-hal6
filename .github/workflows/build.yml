@@ -1,1 +1,178 @@
+name: Build AniVault (IPA and APK)
 
+# Lives in a PUBLIC repo that contains nothing but this file.
+# It checks out your PRIVATE repo with a token, builds from it, and uploads
+# the IPA and APK to a release in the PRIVATE repo. Nothing is published here.
+# Do NOT add upload-artifact steps: artifacts of public repos are downloadable
+# by any signed-in GitHub user.
+on:
+  workflow_dispatch:
+    inputs:
+      private_repo:
+        description: 'Private repo to build, as owner/name'
+        required: true
+      ref:
+        description: 'Branch, tag or commit to build (empty = default branch)'
+        required: false
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: anivault-build
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: ${{ inputs.private_repo }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.info.outputs.tag }}
+      version: ${{ steps.info.outputs.version }}
+      name: ${{ steps.info.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.private_repo }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ inputs.ref }}
+          sparse-checkout: lib/release.json
+          persist-credentials: false
+      - name: Read version and make sure the private release exists
+        id: info
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          VERSION=$(jq -r '.version' lib/release.json | tr -cd 'A-Za-z0-9._-')
+          if [ -z "$VERSION" ]; then echo "No version in lib/release.json"; exit 1; fi
+          TAG="v$VERSION"
+          NAME="${PRIVATE_REPO#*/}-V${VERSION}"
+          if ! gh release view "$TAG" --repo "$PRIVATE_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$PRIVATE_REPO" \
+              --title "AniVault V$VERSION" --notes "Built with the public builder." \
+              --target "$(git rev-parse HEAD)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+  ios:
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      OUT_NAME: ${{ needs.prepare.outputs.name }}.ipa
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.private_repo }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ inputs.ref }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install and prebuild
+        working-directory: src
+        run: |
+          if [ -f app.json ]; then
+            node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('app.json'));j.expo=j.expo||{};j.expo.ios=j.expo.ios||{};j.expo.ios.bundleIdentifier=j.expo.ios.bundleIdentifier||'com.abd4n738.anivault';fs.writeFileSync('app.json',JSON.stringify(j,null,2))"
+          fi
+          npm install --legacy-peer-deps
+          npm run test:backup
+          npx expo prebuild -p ios
+      - name: Build
+        working-directory: src
+        run: |
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -n1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          APP=$(ls -d build/Build/Products/Release-iphoneos/*.app | head -n1)
+          mkdir Payload
+          cp -r "$APP" Payload/
+          zip -r "$GITHUB_WORKSPACE/$OUT_NAME" Payload
+      - name: Upload IPA to the PRIVATE repo release
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: gh release upload "$TAG" "$GITHUB_WORKSPACE/$OUT_NAME" --clobber --repo "$PRIVATE_REPO"
+
+  android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      APK: ${{ needs.prepare.outputs.name }}.apk
+      APPDIR: ${{ github.workspace }}/src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.private_repo }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ inputs.ref }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install and prebuild
+        run: |
+          cd "$APPDIR"
+          if [ -f app.json ]; then
+            node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('app.json'));j.expo=j.expo||{};j.expo.android=j.expo.android||{};j.expo.android.package=j.expo.android.package||'com.abd4n738.anivault';fs.writeFileSync('app.json',JSON.stringify(j,null,2))"
+          fi
+          npm ci
+          npm run test:backup
+          npm run test:lock
+          npx expo prebuild -p android
+      - name: Build
+        run: |
+          cd "$APPDIR/android"
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --max-workers=2 -PreactNativeArchitectures=arm64-v8a,x86_64 -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g"
+          OUT=$(find app/build/outputs/apk/release -name '*.apk' | head -n1)
+          if [ -z "$OUT" ]; then echo "No APK was produced"; exit 1; fi
+          cp "$OUT" "$GITHUB_WORKSPACE/$APK"
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Verify Android 13 cold launch
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash "$APPDIR/scripts/check-android-launch.sh" "$GITHUB_WORKSPACE/$APK"
+      - name: Send launch diagnostics to the PRIVATE release (only if the check failed)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          DIR=""
+          if [ -d android-launch-diagnostics ]; then DIR=android-launch-diagnostics; fi
+          if [ -z "$DIR" ] && [ -d src/android-launch-diagnostics ]; then DIR=src/android-launch-diagnostics; fi
+          if [ -n "$DIR" ]; then
+            zip -r android-launch-diagnostics.zip "$DIR"
+            gh release upload "$TAG" android-launch-diagnostics.zip --clobber --repo "$PRIVATE_REPO"
+          else
+            echo "No diagnostics folder found."
+          fi
+      - name: Upload APK to the PRIVATE repo release
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: gh release upload "$TAG" "$GITHUB_WORKSPACE/$APK" --clobber --repo "$PRIVATE_REPO"
