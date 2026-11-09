@@ -15,6 +15,14 @@ on:
         description: 'Branch, tag or commit to build (empty = default branch)'
         required: false
         default: ''
+      build_ios:
+        description: 'Build the IPA (uncheck if the release already has a good one)'
+        type: boolean
+        default: true
+      build_android:
+        description: 'Build the APK'
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -60,6 +68,7 @@ jobs:
 
   ios:
     needs: prepare
+    if: ${{ inputs.build_ios }}
     runs-on: macos-latest
     timeout-minutes: 60
     env:
@@ -105,6 +114,7 @@ jobs:
 
   android:
     needs: prepare
+    if: ${{ inputs.build_android }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -141,7 +151,18 @@ jobs:
         run: |
           cd "$APPDIR/android"
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --max-workers=2 -PreactNativeArchitectures=arm64-v8a,x86_64 -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g"
+          # Retry: downloads from Maven/GitHub sometimes fail with 504. Gradle keeps
+          # what it already fetched, so each retry only gets what is missing.
+          OK=""
+          for ATTEMPT in 1 2 3 4; do
+            if ./gradlew assembleRelease --no-daemon --max-workers=2 -PreactNativeArchitectures=arm64-v8a,x86_64 -Dorg.gradle.jvmargs="-Xmx3g -XX:MaxMetaspaceSize=1g"; then
+              OK=yes
+              break
+            fi
+            echo "Gradle attempt $ATTEMPT failed."
+            if [ "$ATTEMPT" -lt 4 ]; then echo "Waiting 90 seconds before retrying..."; sleep 90; fi
+          done
+          if [ -z "$OK" ]; then echo "Gradle failed after 4 attempts"; exit 1; fi
           OUT=$(find app/build/outputs/apk/release -name '*.apk' | head -n1)
           if [ -z "$OUT" ]; then echo "No APK was produced"; exit 1; fi
           cp "$OUT" "$GITHUB_WORKSPACE/$APK"
