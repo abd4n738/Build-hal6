@@ -23,6 +23,14 @@ on:
         description: 'Build the APK'
         type: boolean
         default: true
+      verify_launch:
+        description: 'Run the Android 13 emulator launch check before uploading the APK'
+        type: boolean
+        default: true
+      disable_minify:
+        description: 'TEST ONLY: turn R8 shrinking off (leave unticked to test the app fix)'
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -138,6 +146,8 @@ jobs:
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
       - name: Install and prebuild
+        env:
+          DISABLE_MINIFY: ${{ inputs.disable_minify }}
         run: |
           cd "$APPDIR"
           if [ -f app.json ]; then
@@ -147,6 +157,20 @@ jobs:
           npm run test:backup
           npm run test:lock
           npx expo prebuild -p android
+          # Optional test only: turn R8 shrinking off (tick "disable_minify").
+          # Leave it unticked to test the app's own fix with normal release settings.
+          if [ "$DISABLE_MINIFY" = "true" ]; then
+            {
+              echo ""
+              echo "android.enableMinifyInReleaseBuilds=false"
+              echo "android.enableShrinkResourcesInReleaseBuilds=false"
+            } >> android/gradle.properties
+            echo "Shrinking is turned OFF for this build."
+          else
+            echo "Shrinking left at the project's normal release settings."
+          fi
+          echo "--- effective shrink settings in android/gradle.properties ---"
+          grep -n -i "minify\|shrink" android/gradle.properties || echo "(no minify/shrink lines)"
       - name: Build
         run: |
           cd "$APPDIR/android"
@@ -167,11 +191,13 @@ jobs:
           if [ -z "$OUT" ]; then echo "No APK was produced"; exit 1; fi
           cp "$OUT" "$GITHUB_WORKSPACE/$APK"
       - name: Enable emulator acceleration
+        if: ${{ inputs.verify_launch }}
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Verify Android 13 cold launch
+        if: ${{ inputs.verify_launch }}
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 33
